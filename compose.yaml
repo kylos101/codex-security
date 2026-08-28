@@ -1,6 +1,8 @@
 services:
   codex-security:
     image: ${CODEX_SECURITY_IMAGE:-codex-security:local}
+    profiles:
+      - scan
     build:
       context: .
     init: true
