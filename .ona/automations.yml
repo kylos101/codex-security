@@ -17,14 +17,20 @@ tasks:
       - manual
       - prebuild
 
-  start-findings:
-    name: Start findings service
-    command: docker compose up --detach --no-build findings
+  compose-up:
+    name: Compose up
+    command: docker compose up --detach --no-build && ona environment port open 3000 --name findings --admission creator_only
     dependsOn:
       - install
     triggeredBy:
       - manual
       - postDevcontainerStart
+
+  compose-down:
+    name: Compose down
+    command: docker compose down
+    triggeredBy:
+      - manual
 
   build:
     name: Build
