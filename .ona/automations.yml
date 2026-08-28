@@ -12,9 +12,19 @@ tasks:
       pnpm --dir sdk/typescript install --frozen-lockfile
       npm ci --prefix plugins/codex-security/mcp-app --no-audit --no-fund
       python -m pip install --disable-pip-version-check --no-input -e 'plugins/codex-security[test]'
+      docker compose build codex-security findings
     triggeredBy:
       - manual
       - prebuild
+
+  start-findings:
+    name: Start findings service
+    command: docker compose up --detach --no-build findings
+    dependsOn:
+      - install
+    triggeredBy:
+      - manual
+      - postDevcontainerStart
 
   build:
     name: Build
