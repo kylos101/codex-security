@@ -56,23 +56,20 @@ try {
     const decisions = new Set<string>();
     for (const row of reviews) {
       const result = JSON.parse(row["result_json"] as string);
-      models.add(row["model"] as string);
+      const model = row["model"] as string;
+      models.add(model);
       assert.ok(row["source_content_digest"]);
       assert.ok(row["prompt_digest"] && row["contract_digest"]);
       for (const decision of "decisions" in result
-        ? result.decisions
+        ? Object.values(result.decisions)
         : [result]) {
         decisions.add(decision.decision);
-        if (decision.decision === "SAME") {
-          assert.equal(typeof decision.canonicalFindingId, "string");
-          assert.equal(
-            decision.mergedFinding.findingId,
-            decision.canonicalFindingId,
-          );
-          assert.ok(
-            decision.mergedFinding.extensions.mergedOriginals.length > 0,
-          );
-        }
+        assert.deepEqual(Object.keys(decision).sort(), [
+          "decision",
+          "rationale",
+        ]);
+        assert.equal(typeof decision.rationale, "string");
+        assert.ok(decision.rationale.trim());
       }
     }
     assert.deepEqual(models, new Set(["gpt-5.6-luna", "gpt-5.6-sol"]));

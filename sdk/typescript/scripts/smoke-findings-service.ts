@@ -1,3 +1,4 @@
+import { parseJsonLines } from "../tests-ts/support/json.js";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
@@ -13,9 +14,7 @@ import type { DashboardSnapshot } from "../src/server/dashboard-types.js";
 
 const repositoryRoot = fileURLToPath(new URL("../../../", import.meta.url));
 const container = `findings-ci-${process.pid}`;
-const image = process.argv[2] ?? "codex-security-findings:local";
-const runnerImage =
-  process.env["CODEX_SECURITY_IMAGE"] ?? "codex-security:runner-smoke";
+const image = process.argv[2] ?? "codex-security:local";
 const compose = ["compose", "-p", container, "-f", "compose.findings.yaml"];
 const runnerRoot = await mkdtemp(join(tmpdir(), "codex-security-runner-"));
 const runnerCompose = [
@@ -55,22 +54,20 @@ const findings: Finding[] = [
     ...example,
     extensions: { ...example.extensions, smokeGroup: "duplicate" },
   },
-  ...[1, 2, 3].map(
-    (index): Finding => ({
-      ...example,
-      findingId: `csf_${"f".repeat(23)}${index}`,
-      occurrenceId: `occ_${"f".repeat(23)}${index}`,
-      fingerprints: {
-        ...example.fingerprints,
-        primary: `codex-security/v1:sha256:${"f".repeat(63)}${index}`,
-      },
-      title: `Synthetic finding ${index}`,
-      extensions: {
-        ...example.extensions,
-        smokeGroup: index < 3 ? "duplicate" : "distinct",
-      },
-    }),
-  ),
+  ...[1, 2, 3].map((index): Finding => ({
+    ...example,
+    findingId: `csf_${"f".repeat(23)}${index}`,
+    occurrenceId: `occ_${"f".repeat(23)}${index}`,
+    fingerprints: {
+      ...example.fingerprints,
+      primary: `codex-security/v1:sha256:${"f".repeat(63)}${index}`,
+    },
+    title: `Synthetic finding ${index}`,
+    extensions: {
+      ...example.extensions,
+      smokeGroup: index < 3 ? "duplicate" : "distinct",
+    },
+  })),
 ];
 const ids = findings.map((finding) => finding.findingId);
 
@@ -80,7 +77,7 @@ function docker(args: string[], { check = true, status = 0 } = {}): string {
     env: {
       ...process.env,
       CODEX_SECURITY_FINDINGS_IMAGE: image,
-      CODEX_SECURITY_IMAGE: runnerImage,
+      CODEX_SECURITY_IMAGE: image,
       CODEX_SECURITY_USER: `${process.getuid!()}:${process.getgid!()}`,
       CODEX_SECURITY_RESULTS: join(runnerRoot, "results"),
       CODEX_SECURITY_STATE: join(runnerRoot, "state"),
@@ -302,21 +299,15 @@ async function checkStoredGroups(): Promise<FindingDedupeGroup[]> {
 }
 
 async function checkReviews(): Promise<void> {
-  const calls = (
+  const calls = parseJsonLines<{
+    stage: string;
+    findingIds: string[];
+  }>(
     await readFile(
       join(runnerRoot, "results/.codex-security-state/review-calls.jsonl"),
       "utf8",
-    )
-  )
-    .trim()
-    .split("\n")
-    .map(
-      (line) =>
-        JSON.parse(line) as {
-          stage: string;
-          findingIds: string[];
-        },
-    );
+    ),
+  );
   for (const stage of ["screen", "pair"]) {
     assert.ok(
       calls.some((call) => call.stage === stage),
@@ -358,9 +349,7 @@ try {
     }),
   );
   if (!process.argv[2])
-    docker(["build", "--target", "findings-service", "--tag", image, "."]);
-  if (!process.env["CODEX_SECURITY_IMAGE"])
-    docker(["build", "--target", "scanner", "--tag", runnerImage, "."]);
+    docker(["build", "--target", "scanner", "--tag", image, "."]);
   await startService();
   docker([...runnerCompose, "config", "--quiet"]);
   docker([

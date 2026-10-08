@@ -1,35 +1,263 @@
+import { nodeCommand } from "./support/shell.js";
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { chmod, mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { join, relative } from "node:path";
+import { pathToFileURL } from "node:url";
 import type { CodexOptions } from "@openai/codex-sdk";
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test, mock } from "bun:test";
 import { parse as parseToml } from "smol-toml";
 import { initialCredentialsAvailable } from "../src/api.js";
+import { AuthenticationRequiredError } from "../src/errors.js";
 import { setCodexSecurityCredentialLogout } from "../src/runtime.js";
-import { PLUGIN_ROOT } from "./plugin-root.js";
+import { copyCompletedScan, PLUGIN_ROOT } from "./plugin-root.js";
 import { shellEnvironmentReference, TestClient } from "./support/api-client.js";
 import {
+  codexFactory,
   completedEvents,
-  createApiTestFixtures,
+  preparedRuntime,
 } from "./support/api-events.js";
+import { createApiTestFixtures } from "./support/temporary-directories.js";
 
-const { cleanup, copyCompletedScan, temporaryDirectory } =
-  createApiTestFixtures();
+const { cleanup, temporaryDirectory } = createApiTestFixtures();
 afterEach(cleanup);
 
 describe("CodexSecurity orchestration", () => {
+  test.each([
+    "direct",
+    "profile",
+    "profile-providers",
+    "profile-providers-ambient",
+    "profile-inherited-cwd",
+    "profile-overridden-cwd",
+    "profile-strict",
+    "null optional args",
+    "null optional cwd",
+  ])(
+    "runs native command authentication without importing credentials (%s)",
+    async (selection) => {
+      const profile =
+        selection === "profile" || selection.startsWith("profile-");
+      const profileProviders = profile && selection !== "profile";
+      const inheritedCwd = selection === "profile-inherited-cwd";
+      const overriddenCwd = selection === "profile-overridden-cwd";
+      const strict = selection === "profile-strict";
+      const root = await temporaryDirectory();
+      const repository = join(root, "repository");
+      const home = join(root, "model-home");
+      const state = join(root, "state");
+      const scanDir = join(root, "scan");
+      await mkdir(repository);
+      await mkdir(home);
+      await mkdir(scanDir, { mode: 0o700 });
+      const runtimeHome = join(state, "codex-home");
+      if (profile) await mkdir(runtimeHome, { recursive: true, mode: 0o700 });
+      await writeFile(join(home, "auth.json"), '{"auth_mode":"chatgpt"}\n');
+      const auth = {
+        command: "./synthetic-auth",
+        args: selection === "null optional args" ? null : ["token"],
+        refresh_interval_ms: 1000,
+        ...(profile
+          ? { cwd: "helpers" }
+          : selection === "null optional cwd"
+            ? { cwd: null }
+            : {}),
+      };
+      const definition = {
+        name: "Synthetic",
+        base_url: "https://provider.example/v1",
+        wire_api: "responses",
+        auth,
+      };
+      const rootDefinition = {
+        ...definition,
+        auth: {
+          ...auth,
+          ...(inheritedCwd || overriddenCwd ? { cwd: "root-helpers" } : {}),
+        },
+      };
+      const selectedDefinition =
+        inheritedCwd || overriddenCwd
+          ? {
+              auth: {
+                command: "./selected-auth",
+                ...(overriddenCwd ? { cwd: "selected-helpers" } : {}),
+              },
+            }
+          : definition;
+      const overrides = {
+        ...(strict ? { approval_policy: "never" } : {}),
+        ...(profile
+          ? {
+              profile: "review",
+              profiles: {
+                review: {
+                  model_provider: "synthetic.provider",
+                  service_tier: "fast",
+                  ...(strict ? { approval_policy: "on-request" } : {}),
+                  ...(profileProviders
+                    ? {
+                        model_providers: {
+                          "synthetic.provider": selectedDefinition,
+                        },
+                      }
+                    : {}),
+                },
+              },
+            }
+          : { model_provider: "synthetic.provider" }),
+        ...(!profileProviders || inheritedCwd || overriddenCwd
+          ? { model_providers: { "synthetic.provider": rootDefinition } }
+          : {}),
+      };
+      const originalOverrides = structuredClone(overrides);
+      let captured: (CodexOptions & { nativeProfile?: string }) | undefined;
+      const client = new TestClient(
+        { pluginPath: PLUGIN_ROOT, codexOverrides: overrides },
+        {
+          environment: {
+            CODEX_HOME: relative(process.cwd(), home),
+            CODEX_SECURITY_STATE_DIR: state,
+            ...(selection === "profile" ||
+            selection === "profile-providers-ambient"
+              ? {
+                  OPENAI_API_KEY: "synthetic-ambient-key",
+                  CODEX_API_KEY: "synthetic-other-key",
+                }
+              : {}),
+          },
+          resolvePluginPython: async () => "/managed/python",
+          ...(profile
+            ? {
+                prepareRuntime: async () => ({
+                  ...preparedRuntime(runtimeHome),
+                  credentialsAvailable: false,
+                }),
+              }
+            : {}),
+          prepareOutputDir: async () => scanDir,
+          repositoryRevision: async () => "deadbeef",
+          createCodex: (options) => {
+            captured = options;
+            return {
+              startThread: () => ({
+                id: null,
+                async runStreamed() {
+                  if (!profile) {
+                    const preflightConfig = parseToml(
+                      await readFile(
+                        options.env!["CODEX_SECURITY_CONFIG_PATH"]!,
+                        "utf8",
+                      ),
+                    );
+                    expect(preflightConfig["model_provider"]).toBe(
+                      "synthetic.provider",
+                    );
+                    expect(preflightConfig["model_providers"]).toBeUndefined();
+                    if (process.platform !== "win32") {
+                      expect(
+                        (
+                          await stat(
+                            options.env!["CODEX_SECURITY_CONFIG_PATH"]!,
+                          )
+                        ).mode & 0o777,
+                      ).toBe(0o600);
+                    }
+                  }
+                  throw new Error("synthetic command-auth scan started");
+                },
+              }),
+            };
+          },
+        },
+      );
+      try {
+        const preflight = await client.preflight(repository);
+        expect(preflight.authentication).toEqual({
+          method: "command",
+          verified: false,
+        });
+        expect(JSON.stringify(preflight)).not.toContain("synthetic-auth");
+        await expect(client.run(repository)).rejects.toThrow(
+          "synthetic command-auth scan started",
+        );
+        expect(captured?.apiKey).toBeUndefined();
+        expect(captured?.env).not.toHaveProperty("OPENAI_API_KEY");
+        expect(captured?.env).not.toHaveProperty("CODEX_API_KEY");
+        expect(captured?.env?.["CODEX_HOME"]).toBe(join(state, "codex-home"));
+        const provider = {
+          ...definition,
+          auth: {
+            command: auth.command,
+            refresh_interval_ms: auth.refresh_interval_ms,
+            ...(auth.args === null ? {} : { args: auth.args }),
+            ...(inheritedCwd || overriddenCwd
+              ? { command: "./selected-auth" }
+              : {}),
+            cwd: !profile
+              ? home
+              : join(
+                  home,
+                  inheritedCwd
+                    ? "root-helpers"
+                    : overriddenCwd
+                      ? "selected-helpers"
+                      : "helpers",
+                ),
+          },
+        };
+        expect(JSON.stringify(captured!.configOverrides ?? [])).not.toContain(
+          "model_providers",
+        );
+        expect(
+          parseToml(
+            await readFile(
+              join(runtimeHome, `${captured!.nativeProfile}.config.toml`),
+              "utf8",
+            ),
+          ),
+        ).toEqual({
+          model_providers: { "synthetic.provider": provider },
+        });
+        if (profile) {
+          expect(captured?.config?.["profile"]).toBeUndefined();
+          expect(captured?.config?.["profiles"]).toBeUndefined();
+          expect(captured?.config?.["model_provider"]).toBe(
+            "synthetic.provider",
+          );
+          expect(captured?.config?.["service_tier"]).toBe("fast");
+          if (strict)
+            expect(captured?.config?.["approval_policy"]).toBe("never");
+        } else {
+          const saved = parseToml(
+            await readFile(join(runtimeHome, "config.toml"), "utf8"),
+          );
+          expect(saved["model_provider"]).toBeUndefined();
+          expect(saved["model_providers"]).toBeUndefined();
+          expect(saved["profiles"]).toBeUndefined();
+        }
+        expect(existsSync(join(state, "codex-home", "auth.json"))).toBe(false);
+        expect(overrides).toEqual(originalOverrides);
+      } finally {
+        await client.close();
+      }
+    },
+  );
+
   test("keeps a private preflight snapshot isolated from persistent credentials", async () => {
     const root = await temporaryDirectory();
     const repository = join(root, "repository");
     const ambientHome = join(root, "ambient-codex-home");
     const scanDir = join(root, "scan");
-    await mkdir(repository);
-    await mkdir(ambientHome);
+    await mkdir(repository, { mode: 0o700 });
+    await mkdir(ambientHome, { mode: 0o700 });
     await mkdir(scanDir, { mode: 0o700 });
     await writeFile(join(ambientHome, "auth.json"), "{}\n");
     const interpreter =
-      Bun.which("python3") ?? Bun.which("python") ?? Bun.which("py");
+      process.env["PYTHON"] ??
+      Bun.which("python") ??
+      Bun.which("py") ??
+      Bun.which("python3");
     expect(interpreter).not.toBeNull();
     let capturedConfigPath: string | undefined;
     let capturedCodexHome: string | undefined;
@@ -96,7 +324,7 @@ describe("CodexSecurity orchestration", () => {
                         "plugins",
                         "codex-security",
                         "codex-home",
-                      )]: "read",
+                      )]: { ".": "deny" },
                     },
                   },
                 },
@@ -115,7 +343,7 @@ describe("CodexSecurity orchestration", () => {
                 allow_login_shell: false,
                 model_reasoning_summary: "detailed",
                 show_raw_agent_reasoning: true,
-                windows: { sandbox: "unelevated" },
+                windows: { sandbox: "elevated" },
                 mcp_servers: {
                   private: {
                     command: "echo",
@@ -237,7 +465,9 @@ describe("CodexSecurity orchestration", () => {
         { pluginPath: PLUGIN_ROOT },
         {
           environment: {
-            CODEX_HOME: ambientHome,
+            HOME: root,
+            USERPROFILE: root,
+            CODEX_HOME: "~/ambient-codex-home",
             CODEX_SECURITY_STATE_DIR: stateDirectory,
           },
           resolvePluginPython: async () => "/managed/python",
@@ -274,10 +504,7 @@ describe("CodexSecurity orchestration", () => {
     await writeFile(join(ambientHome, "auth.json"), "{}\n");
     let scansStarted = 0;
     const deepScanConfigPaths = new Set<string>();
-    let releaseScans!: () => void;
-    const concurrentScans = new Promise<void>((resolve) => {
-      releaseScans = resolve;
-    });
+    const concurrentScans = Promise.withResolvers<void>();
 
     const clients = await Promise.all(
       [0, 1].map(async (index) => {
@@ -307,40 +534,34 @@ describe("CodexSecurity orchestration", () => {
                 options.env?.["CODEX_SECURITY_DEEP_SCAN_CONFIG_PATH"];
               expect(typeof deepScanConfigPath).toBe("string");
               deepScanConfigPaths.add(deepScanConfigPath!);
-              return {
-                startThread: () => ({
-                  id: null,
-                  async runStreamed() {
-                    expect(
-                      existsSync(
-                        join(credentialHome, ".codex-security-scan.lock"),
-                      ),
-                    ).toBe(false);
-                    if (++scansStarted === 2) releaseScans();
-                    const credentialConfig = parseToml(
-                      await readFile(
-                        join(credentialHome, "config.toml"),
-                        "utf8",
-                      ),
-                    );
-                    expect(credentialConfig["model"]).toBeUndefined();
-                    const before = parseToml(
-                      await readFile(deepScanConfigPath!, "utf8"),
-                    );
-                    expect(before["deep_scan"]).toMatchObject({
-                      workers: index + 2,
-                    });
-                    await concurrentScans;
-                    const after = parseToml(
-                      await readFile(deepScanConfigPath!, "utf8"),
-                    );
-                    expect(after["deep_scan"]).toMatchObject({
-                      workers: index + 2,
-                    });
-                    throw new Error("parallel managed scan reached");
-                  },
-                }),
-              };
+              return codexFactory(async () => {
+                if (++scansStarted === 2) {
+                  expect(
+                    existsSync(
+                      join(credentialHome, ".codex-security-scan.lock"),
+                    ),
+                  ).toBe(false);
+                  concurrentScans.resolve();
+                }
+                const credentialConfig = parseToml(
+                  await readFile(join(credentialHome, "config.toml"), "utf8"),
+                );
+                expect(credentialConfig["model"]).toBeUndefined();
+                const before = parseToml(
+                  await readFile(deepScanConfigPath!, "utf8"),
+                );
+                expect(before["deep_scan"]).toMatchObject({
+                  workers: index + 2,
+                });
+                await concurrentScans.promise;
+                const after = parseToml(
+                  await readFile(deepScanConfigPath!, "utf8"),
+                );
+                expect(after["deep_scan"]).toMatchObject({
+                  workers: index + 2,
+                });
+                throw new Error("parallel managed scan reached");
+              })();
             },
           },
         );
@@ -352,7 +573,7 @@ describe("CodexSecurity orchestration", () => {
         clients.map((client, index) =>
           client
             .run(repository, { mode: "deep", workers: index + 2 })
-            .finally(releaseScans),
+            .finally(concurrentScans.resolve),
         ),
       );
       for (const result of results) {
@@ -375,7 +596,7 @@ describe("CodexSecurity orchestration", () => {
         ),
       ).toBe(true);
     } finally {
-      releaseScans();
+      concurrentScans.resolve();
       await Promise.all(clients.map(async (client) => await client.close()));
     }
   });
@@ -394,10 +615,25 @@ describe("CodexSecurity orchestration", () => {
     await writeFile(join(ambientHome, "auth.json"), ambientAuthentication);
     const runs: Array<{ home: string; apiKey?: string }> = [];
     const client = new TestClient(
-      { pluginPath: PLUGIN_ROOT },
+      {
+        pluginPath: PLUGIN_ROOT,
+        codexOverrides: {
+          model_provider: "synthetic.account",
+          model_providers: {
+            "synthetic.account": {
+              name: "Synthetic account provider",
+              wire_api: "responses",
+              requires_openai_auth: true,
+              auth: null,
+            },
+          },
+        },
+      },
       {
         environment: {
-          CODEX_HOME: ambientHome,
+          HOME: root,
+          USERPROFILE: root,
+          CODEX_HOME: "~/ambient-codex-home",
           CODEX_SECURITY_STATE_DIR: stateDirectory,
           OPENAI_API_KEY: "synthetic-transient-key",
         },
@@ -451,15 +687,12 @@ describe("CodexSecurity orchestration", () => {
     await mkdir(credentialHome, { mode: 0o700 });
     await writeFile(join(ambientHome, "auth.json"), '{"token":"ambient"}\n');
     await setCodexSecurityCredentialLogout(credentialHome, true);
-    let imported = false;
+    const imported = mock((Promise.resolve<boolean>).bind(Promise, true));
 
     await expect(
-      initialCredentialsAvailable({}, ambientHome, credentialHome, async () => {
-        imported = true;
-        return true;
-      }),
+      initialCredentialsAvailable({}, ambientHome, credentialHome, imported),
     ).resolves.toBe(false);
-    expect(imported).toBe(false);
+    expect(imported).not.toHaveBeenCalled();
 
     await setCodexSecurityCredentialLogout(credentialHome, false);
     await expect(
@@ -471,4 +704,145 @@ describe("CodexSecurity orchestration", () => {
       ),
     ).resolves.toBe(true);
   });
+
+  test("respects another client's logout when switching from API-key to ChatGPT scans", async () => {
+    const root = await temporaryDirectory();
+    const repository = join(root, "repository");
+    const ambientHome = join(root, "ambient-home");
+    const stateDirectory = join(root, "state");
+    const scanDir = join(root, "scan");
+    await mkdir(repository);
+    await mkdir(ambientHome);
+    await mkdir(scanDir, { mode: 0o700 });
+    await writeFile(
+      join(ambientHome, "auth.json"),
+      '{"auth_mode":"chatgpt"}\n',
+    );
+    const environment = {
+      CODEX_HOME: ambientHome,
+      CODEX_SECURITY_STATE_DIR: stateDirectory,
+      OPENAI_API_KEY: "synthetic-transient-key",
+    };
+    const client = new TestClient(
+      {
+        pluginPath: PLUGIN_ROOT,
+        codexOverrides: { cli_auth_credentials_store: "file" },
+      },
+      {
+        environment,
+        resolvePluginPython: async () => "/managed/python",
+        prepareOutputDir: async () => scanDir,
+        repositoryRevision: async () => "deadbeef",
+        createCodex: () => {
+          throw new Error("synthetic scan started");
+        },
+      },
+    );
+    const logoutClient = new TestClient({}, { environment });
+    const credentials = join(stateDirectory, "codex-home", "auth.json");
+    try {
+      await expect(client.run(repository, { auth: "api-key" })).rejects.toThrow(
+        "synthetic scan started",
+      );
+      await logoutClient.logout();
+      expect(existsSync(credentials)).toBe(false);
+      await expect(client.run(repository, { auth: "chatgpt" })).rejects.toThrow(
+        AuthenticationRequiredError,
+      );
+      expect(existsSync(credentials)).toBe(false);
+    } finally {
+      await Promise.all([client.close(), logoutClient.close()]);
+    }
+  });
+
+  test.skipIf(process.platform === "win32" || process.geteuid?.() === 0)(
+    "reports unreadable ambient credentials during account()",
+    async () => {
+      const root = await temporaryDirectory();
+      const ambientHome = join(root, "ambient-home");
+      const authPath = join(ambientHome, "auth.json");
+      await mkdir(ambientHome);
+      await writeFile(authPath, '{"auth_mode":"chatgpt"}\n', { mode: 0o000 });
+      const client = new TestClient(
+        {},
+        {
+          environment: {
+            CODEX_HOME: ambientHome,
+            CODEX_SECURITY_STATE_DIR: join(root, "state"),
+          },
+          resolveCodexCommand: () => {
+            throw new Error("Must not query Codex after an import failure");
+          },
+        },
+      );
+      try {
+        await expect(client.account()).rejects.toThrow(
+          "Unable to copy ambient Codex authentication.",
+        );
+      } finally {
+        await chmod(authPath, 0o600);
+        await client.close();
+      }
+    },
+  );
+
+  test.each([false, true])(
+    "recognizes ambient credentials during account() on a fresh instance (home-relative: %p)",
+    async (homeRelative) => {
+      const root = await temporaryDirectory();
+      const ambientHome = join(root, "ambient-home");
+      const stateDir = join(root, "state");
+      const script = join(root, "codex.mjs");
+      await mkdir(ambientHome);
+      await mkdir(stateDir, { mode: 0o700 });
+      await writeFile(
+        join(ambientHome, "auth.json"),
+        '{"auth_mode":"chatgpt"}\n',
+      );
+      await writeFile(
+        script,
+        `
+import { existsSync } from "node:fs";
+import { basename, join } from "node:path";
+
+const args = [basename(process.argv[1]), ...process.argv.slice(2)];
+if (args.join(" ") === "login status") {
+  const codexHome = process.env.CODEX_HOME;
+  if (codexHome && existsSync(join(codexHome, "auth.json"))) {
+    console.log("Logged in using ChatGPT");
+    process.exitCode = 0;
+  } else {
+    console.log("Not logged in");
+    process.exitCode = 1;
+  }
+}
+process.exit(process.exitCode ?? 0);
+`,
+      );
+      const client = new TestClient(
+        { pluginPath: PLUGIN_ROOT },
+        {
+          environment: {
+            PATH: process.env["PATH"],
+            NODE_OPTIONS: `--import=${pathToFileURL(script).href}`,
+            HOME: root,
+            USERPROFILE: root,
+            CODEX_HOME: homeRelative ? "~/ambient-home" : ambientHome,
+            CODEX_SECURITY_STATE_DIR: stateDir,
+          },
+          resolveCodexCommand: nodeCommand,
+        },
+      );
+      try {
+        const status = await client.account();
+        expect(status.authenticated).toBe(true);
+        expect(status.details).toContain("Logged in using ChatGPT");
+        expect(existsSync(join(stateDir, "codex-home", "auth.json"))).toBe(
+          true,
+        );
+      } finally {
+        await client.close();
+      }
+    },
+  );
 });

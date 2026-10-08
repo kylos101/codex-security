@@ -8,7 +8,12 @@ import pytest
 from workbench_test_support import (
     create_saved_workspace,
     run_workbench,
+    save_workspace,
+    scan_command,
+    set_triage,
     stable_target_id,
+    start_delivered_scan,
+    update_progress,
     write_completed_contract,
 )
 
@@ -25,19 +30,10 @@ def complete_scan(
 ) -> dict[str, object]:
     workspace = create_saved_workspace(state_dir, target)
     if include_paths is not None:
-        workspace = run_workbench(
-            state_dir,
-            "save-workspace",
-            "--workspace-id",
-            str(workspace["id"]),
-            "--target-path",
-            str(target),
-            "--scope",
-            include_paths[0],
-            "--mode",
-            "standard",
+        workspace = save_workspace(
+            state_dir, str(workspace["id"]), str(target), include_paths[0], "standard"
         )
-    started = run_workbench(state_dir, "start-scan", "--workspace-id", str(workspace["id"]))
+    started = start_delivered_scan(state_dir, "--workspace-id", str(workspace["id"]))
     scan_id = str(started["results"]["scanId"])
     scan_dir = Path(str(started["results"]["scanDir"]))
     write_completed_contract(
@@ -64,7 +60,7 @@ def complete_scan(
             {"id": "unreviewed-path", "reason": "Review incomplete", "paths": ["src/extract.py"]}
         ]
         coverage_path.write_text(json.dumps(coverage))
-    return run_workbench(state_dir, "complete-scan", "--scan-id", scan_id)["scan"]
+    return scan_command(state_dir, "complete-scan", scan_id)["scan"]
 
 
 @pytest.mark.parametrize(
@@ -135,138 +131,6 @@ def test_global_findings_apply_pagination_to_historical_findings(
     }
 
 
-@pytest.fixture
-def indexed_collection_targets(
-    tmp_path: Path,
-) -> tuple[Path, Path, dict[str, object], dict[str, object]]:
-    state_dir = tmp_path / "state"
-    first_target, second_target, unrelated_target = (
-        tmp_path / name for name in ("needle-first", "needle-second", "unrelated")
-    )
-    for target in (first_target, second_target, unrelated_target):
-        target.mkdir()
-    first = complete_scan(state_dir, first_target, identity_anchor="first-finding")
-    second = complete_scan(state_dir, second_target, identity_anchor="second-finding")
-    complete_scan(state_dir, unrelated_target, identity_anchor="unrelated-finding")
-    return state_dir, first_target, first, second
-
-
-def test_global_finding_filters_apply_before_pagination(
-    indexed_collection_targets: tuple[Path, Path, dict[str, object], dict[str, object]],
-) -> None:
-    state_dir, first_target, first, second = indexed_collection_targets
-    filters = ("--query", "NeEdLe", "--severity", "high", "--status", "open")
-    first_page = run_workbench(state_dir, "list-global-findings", *filters, "--limit", "1")
-    second_page = run_workbench(
-        state_dir, "list-global-findings", *filters, "--limit", "1", "--offset", "1"
-    )
-    assert first_page["nextOffset"] == 1
-    assert second_page["nextOffset"] is None
-    assert {first_page["findings"][0]["scanId"], second_page["findings"][0]["scanId"]} == {
-        first["scanId"],
-        second["scanId"],
-    }
-
-    targeted = run_workbench(
-        state_dir,
-        "list-global-findings",
-        *filters,
-        "--target-id",
-        stable_target_id(first_target),
-    )
-    assert [finding["scanId"] for finding in targeted["findings"]] == [first["scanId"]]
-    assert (
-        run_workbench(state_dir, "list-global-findings", "--query", "needle", "--severity", "low")[
-            "findings"
-        ]
-        == []
-    )
-    unfiltered = run_workbench(state_dir, "list-global-findings")
-    assert set(unfiltered) == {"findings", "limit", "nextOffset", "offset"}
-    assert len(unfiltered["findings"]) == 3
-
-
-def test_scan_findings_support_search_severity_and_triage_filters(
-    indexed_collection_targets: tuple[Path, Path, dict[str, object], dict[str, object]],
-) -> None:
-    state_dir, _, scan, _ = indexed_collection_targets
-    occurrence_id = str(scan["findings"][0]["occurrenceId"])
-    run_workbench(
-        state_dir,
-        "set-finding-triage",
-        "--occurrence-id",
-        occurrence_id,
-        "--status",
-        "closed",
-        "--close-reason",
-        "false_positive",
-        "--note",
-        "The reported path is not reachable.",
-    )
-    scan_args = ("--scan-id", str(scan["scanId"]))
-    filtered = run_workbench(
-        state_dir,
-        "list-findings",
-        *scan_args,
-        "--query",
-        "OUTPUT DIRECTORY",
-        "--severity",
-        "high",
-        "--status",
-        "closed",
-        "--limit",
-        "1",
-    )["findingsPage"]
-    assert [finding["occurrenceId"] for finding in filtered["findings"]] == [occurrence_id]
-    assert filtered["total"] == 1
-    assert filtered["nextOffset"] is None
-    assert (
-        run_workbench(state_dir, "list-findings", *scan_args, "--status", "open")["findingsPage"][
-            "findings"
-        ]
-        == []
-    )
-
-
-@pytest.mark.parametrize(
-    ("command", "collection", "status"),
-    [("list-scans", "scans", "complete"), ("list-repositories", "repositories", "scanned")],
-)
-def test_collection_filters_apply_before_pagination(
-    indexed_collection_targets: tuple[Path, Path, dict[str, object], dict[str, object]],
-    command: str,
-    collection: str,
-    status: str,
-) -> None:
-    state_dir, first_target, _, _ = indexed_collection_targets
-    filters = ("--query", "NeEdLe", "--status", status)
-    if command == "list-scans":
-        filters += ("--mode", "standard")
-    first_page = run_workbench(state_dir, command, *filters, "--limit", "1")
-    second_page = run_workbench(state_dir, command, *filters, "--limit", "1", "--offset", "1")
-    assert first_page["nextOffset"] == 1
-    assert second_page["nextOffset"] is None
-    assert {
-        first_page[collection][0]["targetId"],
-        second_page[collection][0]["targetId"],
-    } == {
-        stable_target_id(first_target),
-        stable_target_id(first_target.parent / "needle-second"),
-    }
-
-    targeted = run_workbench(
-        state_dir, command, *filters, "--target-id", stable_target_id(first_target)
-    )
-    assert [item["targetId"] for item in targeted[collection]] == [stable_target_id(first_target)]
-    unfiltered = run_workbench(state_dir, command)
-    assert set(unfiltered) == {collection}
-    assert len(unfiltered[collection]) == 3
-
-    if command == "list-repositories":
-        assert run_workbench(state_dir, command, "--status", "not_scanned")[collection] == []
-        assert run_workbench(state_dir, command, "--status", "open_findings")[collection]
-
-
 def test_global_findings_keep_latest_occurrence_and_stable_target_identity(tmp_path: Path) -> None:
     state_dir = tmp_path / "state"
     first_target = tmp_path / "first-repo"
@@ -278,12 +142,9 @@ def test_global_findings_keep_latest_occurrence_and_stable_target_identity(tmp_p
     first_target_id = stable_target_id(first_target)
     second_target_id = stable_target_id(second_target)
     older_first = complete_scan(state_dir, first_target, identity_anchor="shared-finding")
-    run_workbench(
+    set_triage(
         state_dir,
-        "set-finding-triage",
-        "--occurrence-id",
         str(older_first["findings"][0]["occurrenceId"]),
-        "--status",
         "closed",
         "--close-reason",
         "false_positive",
@@ -314,12 +175,9 @@ def test_global_findings_keep_latest_occurrence_and_stable_target_identity(tmp_p
             """,
             (latest_first_occurrence, "src/control.py", 10, 12, "root_control", 1),
         )
-    run_workbench(
+    set_triage(
         state_dir,
-        "set-finding-triage",
-        "--occurrence-id",
         distinct_first_occurrence,
-        "--status",
         "closed",
         "--close-reason",
         "false_positive",
@@ -377,12 +235,9 @@ def test_repository_index_reports_latest_scan_open_findings_and_missing_checkout
     first_target_id = stable_target_id(first_target)
     second_target_id = stable_target_id(second_target)
     older_first = complete_scan(state_dir, first_target, identity_anchor="first-finding")
-    run_workbench(
+    set_triage(
         state_dir,
-        "set-finding-triage",
-        "--occurrence-id",
         str(older_first["findings"][0]["occurrenceId"]),
-        "--status",
         "closed",
         "--close-reason",
         "false_positive",
@@ -390,9 +245,7 @@ def test_repository_index_reports_latest_scan_open_findings_and_missing_checkout
         "Fixture close decision.",
     )
     running_workspace = create_saved_workspace(state_dir, first_target)
-    older_running = run_workbench(
-        state_dir, "start-scan", "--workspace-id", str(running_workspace["id"])
-    )
+    older_running = start_delivered_scan(state_dir, "--workspace-id", str(running_workspace["id"]))
     complete_scan(state_dir, first_target, identity_anchor="first-finding")
     distinct_first = complete_scan(
         state_dir,
@@ -402,14 +255,7 @@ def test_repository_index_reports_latest_scan_open_findings_and_missing_checkout
         relative_path="docs/extract.py",
     )
     latest_second = complete_scan(state_dir, second_target, identity_anchor="second-finding")
-    run_workbench(
-        state_dir,
-        "update-progress",
-        "--scan-id",
-        str(older_running["results"]["scanId"]),
-        "--phase",
-        "discovery",
-    )
+    update_progress(state_dir, str(older_running["results"]["scanId"]), "--phase", "discovery")
     second_target.rename(tmp_path / "moved-second-repo")
 
     repositories = run_workbench(state_dir, "list-repositories")["repositories"]

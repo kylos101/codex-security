@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import argparse
-import json
 import hashlib
+import json
 import sqlite3
 import sys
 from pathlib import Path
@@ -69,7 +69,9 @@ def save_workflow(connection: sqlite3.Connection, state: dict[str, Any], timesta
     if "pendingWrite" in state["stages"]["dedupe"]:
         results["dedupePendingWrite"] = state["stages"]["dedupe"]["pendingWrite"]
     values.update(
-        results_json=json.dumps(results, allow_nan=False), created_at=timestamp, updated_at=timestamp
+        results_json=json.dumps(results, allow_nan=False),
+        created_at=timestamp,
+        updated_at=timestamp,
     )
     updates = ", ".join(
         f"{column} = excluded.{column}" for column in values if column not in {"id", "created_at"}
@@ -122,12 +124,30 @@ def finding_workflow(
         return {"workflow": read_workflow(connection, workflow_id)}
     if payload["action"] == "source":
         target = Path(payload["repository"]).resolve(strict=True)
-        return {"source": {
-            "repository": str(target),
-            "revision": git_revision(target),
-            "refsDigest": hashlib.sha256((git_output(target, "show-ref") or "").encode()).hexdigest(),
-            "content": directory_content_digest(target, include_ignored=True),
-        }}
+        private_paths = payload.get("privateStatePaths", [])
+        if not isinstance(private_paths, list) or any(
+            not isinstance(path, str) or not Path(path).is_absolute() for path in private_paths
+        ):
+            raise SystemExit("Private runtime paths must be absolute paths.")
+        excluded = tuple(sorted({Path(path).resolve() for path in private_paths}))
+        excluded = tuple(path for path in excluded if path.is_relative_to(target))
+        if target in excluded:
+            raise SystemExit("Private runtime storage must not exclude the repository root.")
+        return {
+            "source": {
+                "repository": str(target),
+                "revision": "unversioned" if payload.get("gitDisabled") else git_revision(target),
+                "refsDigest": hashlib.sha256(
+                    (
+                        "" if payload.get("gitDisabled") else (git_output(target, "show-ref") or "")
+                    ).encode()
+                ).hexdigest(),
+                "content": directory_content_digest(
+                    target, excluded=excluded, include_ignored=True
+                ),
+                **({"privateStatePaths": [str(path) for path in excluded]} if excluded else {}),
+            }
+        }
     if payload["action"] == "get-review":
         row = connection.execute(
             "SELECT result_json FROM finding_workflow_reviews WHERE workflow_id = ? AND review_key = ?",
@@ -148,11 +168,23 @@ def finding_workflow(
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(workflow_id, review_key) DO NOTHING""",
                 (
-                    workflow_id, payload["key"], binding["version"], binding["codexVersion"],
-                    source["repository"], source["revision"], source["refsDigest"], source["content"],
-                    scope.get("repositoryId"), scope.get("allRepositories"), binding["model"],
-                    binding["effort"], binding.get("settingsDigest"), binding["promptDigest"],
-                    binding["contractDigest"], json.dumps(payload["result"], allow_nan=False), timestamp,
+                    workflow_id,
+                    payload["key"],
+                    binding["version"],
+                    binding["codexVersion"],
+                    source["repository"],
+                    source["revision"],
+                    source["refsDigest"],
+                    source["content"],
+                    scope.get("repositoryId"),
+                    scope.get("allRepositories"),
+                    binding["model"],
+                    binding["effort"],
+                    binding.get("settingsDigest"),
+                    binding["promptDigest"],
+                    binding["contractDigest"],
+                    json.dumps(payload["result"], allow_nan=False),
+                    timestamp,
                 ),
             )
         return {}

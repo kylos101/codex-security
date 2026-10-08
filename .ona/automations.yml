@@ -1,34 +1,23 @@
 tasks:
   install:
     name: Install dependencies
-    command: |
-      npm install --global pnpm@11.9.0 bun@1.3.14 --no-audit --no-fund
-      if ! command -v rg >/dev/null 2>&1; then
-        sudo apt-get update \
-          -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources \
-          -o Dir::Etc::sourceparts=-
-        sudo apt-get install --yes ripgrep
-      fi
-      pnpm --dir sdk/typescript install --frozen-lockfile
-      npm ci --prefix plugins/codex-security/mcp-app --no-audit --no-fund
-      python -m pip install --disable-pip-version-check --no-input -e 'plugins/codex-security[test]'
-      docker compose build codex-security findings
+    command: sh .devcontainer/install.sh
     triggeredBy:
       - manual
       - prebuild
 
-  compose-up:
-    name: Compose up
-    command: docker compose up --detach --no-build && ona environment port open 3000 --name findings --admission creator_only
-    dependsOn:
-      - install
+  findings-start:
+    name: Start findings service
+    command: >-
+      docker compose -f compose.findings.yaml up --detach --no-build findings &&
+      ona environment port open 3000 --name findings --admission creator_only
     triggeredBy:
       - manual
       - postDevcontainerStart
 
-  compose-down:
-    name: Compose down
-    command: docker compose down
+  findings-stop:
+    name: Stop findings service
+    command: docker compose -f compose.findings.yaml stop findings
     triggeredBy:
       - manual
 
@@ -41,6 +30,8 @@ tasks:
       - manual
       - prebuild
 
+  # First download the source-matched universal native artifact described in
+  # sdk/typescript/TESTING.md. Dependency installation does not provide it.
   test:
     name: Run tests
     command: |

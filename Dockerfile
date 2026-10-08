@@ -1,16 +1,22 @@
 # syntax=docker/dockerfile:1@sha256:87999aa3d42bdc6bea60565083ee17e86d1f3339802f543c0d03998580f9cb89
 
-FROM node:22-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3 AS package
+FROM node:26-bookworm-slim@sha256:662933cf47f013bc8e4beb31a6116448427a82057ba7c42c97e4c5ba766504c2 AS package
+
+RUN apt-get update \
+    && apt-get install --no-install-recommends --yes python3 \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build/sdk/typescript
 
+COPY package.json /build/package.json
 COPY sdk/typescript/package.json sdk/typescript/pnpm-lock.yaml sdk/typescript/pnpm-workspace.yaml ./
-COPY plugins/codex-security/mcp-app/package.json plugins/codex-security/mcp-app/package-lock.json /build/plugins/codex-security/mcp-app/
+COPY plugins/codex-security/mcp-app/package.json plugins/codex-security/mcp-app/pnpm-lock.yaml plugins/codex-security/mcp-app/pnpm-workspace.yaml /build/plugins/codex-security/mcp-app/
 
-RUN corepack enable \
-    && corepack prepare "$(node --print 'require("./package.json").packageManager')" --activate \
+RUN npm install --global --no-audit --no-fund corepack@0.36.0 \
+    && corepack enable \
+    && corepack prepare "$(node --print 'require("/build/package.json").packageManager')" --activate \
     && pnpm install --frozen-lockfile \
-    && npm ci --prefix /build/plugins/codex-security/mcp-app --no-audit --no-fund
+    && pnpm --dir /build/plugins/codex-security/mcp-app install --frozen-lockfile
 
 COPY sdk/typescript/ ./
 COPY plugins/codex-security/ /build/plugins/codex-security/
@@ -19,10 +25,10 @@ RUN pnpm run types \
     && pnpm pack --pack-destination /build/package \
     && node scripts/check-package.mjs /build/package/*.tgz
 
-FROM node:22-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3 AS runtime
+FROM node:26-bookworm-slim@sha256:662933cf47f013bc8e4beb31a6116448427a82057ba7c42c97e4c5ba766504c2 AS scanner
 
 LABEL org.opencontainers.image.title="Codex Security" \
-      org.opencontainers.image.description="Noninteractive, resumable Codex Security CSV repository scans" \
+      org.opencontainers.image.description="Codex Security scanner and findings API" \
       org.opencontainers.image.source="https://github.com/openai/codex-security"
 
 RUN apt-get update \
@@ -58,22 +64,6 @@ ENV CODEX_HOME=/state \
 
 USER 10001:10001
 WORKDIR /state
-
-FROM runtime AS findings-service
-
-LABEL org.opencontainers.image.description="Codex Security findings API"
-
-ENV HOST=0.0.0.0 \
-    PORT=3000 \
-    CODEX_SECURITY_STATE_DIR=/state
-
-WORKDIR /usr/local/lib/node_modules/@openai/codex-security
-EXPOSE 3000
-
-ENTRYPOINT ["node"]
-CMD ["dist/server/index.js"]
-
-FROM runtime AS scanner
 
 ENTRYPOINT ["/usr/local/bin/codex-security-entrypoint"]
 CMD ["--help"]
